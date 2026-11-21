@@ -1,6 +1,6 @@
 #!/system/bin/sh
 ############################################################
-# 运营商 DM 出站阻断  v1.0（三家合集）
+# 运营商 DM 出站阻断  v2.1（三家合集）
 #   联通 com.mobiletools.systemhelper
 #   移动 com.coloros.regservice        （PMS 层隐藏，界面查不到）
 #   电信 com.oppo.ctautoregist
@@ -19,6 +19,11 @@ PKG_CMCC=com.coloros.regservice
 PKG_CT=com.oppo.ctautoregist
 PKGS="$PKG_UNICOM $PKG_CMCC $PKG_CT"
 
+UID_MUL=100000
+USER_DATA_ROOT=${USER_DATA_ROOT:-/data/user}
+MAX_ROUNDS=20
+RETRY_SEC=15
+
 mkdir -p "$UIDDIR" 2>/dev/null
 
 log() { echo "[$(date '+%F %T')] $*" >> "$LOG" 2>/dev/null; }
@@ -28,30 +33,66 @@ parse_pm() {
   sed -n 's/.*uid:\([0-9]\{1,\}\).*/\1/p' | head -1
 }
 
-detect_uid() {
-  pkg="$1"
-  u=""
-  have pm && u=$(pm list packages -U 2>/dev/null | grep -F "package:$pkg " | parse_pm)
-  [ -z "$u" ] && have cmd && u=$(cmd package list packages -U 2>/dev/null | grep -F "package:$pkg " | parse_pm)
-  [ -z "$u" ] && u=$(dumpsys package "$pkg" 2>/dev/null | grep -o 'appId=[0-9]*' | head -1 | cut -d= -f2)
-  [ -z "$u" ] && u=$(stat -c %u "/data/user/0/$pkg" 2>/dev/null)
-  [ -z "$u" ] && u=$(stat -c %u "/data/data/$pkg" 2>/dev/null)
-  if [ -z "$u" ] && [ -f /data/system/packages.list ]; then
-    u=$(grep "^$pkg " /data/system/packages.list 2>/dev/null | awk '{print $2}')
+normalize_appid() {
+  n="$1"
+  case "$n" in ''|*[!0-9]*) echo ""; return ;; esac
+  if [ "$n" -ge "$UID_MUL" ]; then
+    n=$((n % UID_MUL))
   fi
-  case "$u" in ''|*[!0-9]*) u="" ;; esac
-  if [ -n "$u" ] && [ "$u" -lt 10000 ]; then u=""; fi
-  echo "$u"
+  if [ "$n" -lt 10000 ]; then n=""; fi
+  echo "$n"
 }
 
-uid_of() { cat "$UIDDIR/$1.uid" 2>/dev/null; }
-
-store_uid() {
-  u=$(detect_uid "$1")
-  if [ -n "$u" ]; then
-    echo "$u" > "$UIDDIR/$1.uid"
+appid_of() {
+  pkg="$1"
+  a=""
+  [ -z "$a" ] && a=$(dumpsys package "$pkg" 2>/dev/null | grep -m1 -o 'appId=[0-9]*' | cut -d= -f2)
+  [ -z "$a" ] && [ -f /data/system/packages.list ] && \
+    a=$(grep "^$pkg " /data/system/packages.list 2>/dev/null | awk '{print $2}')
+  if [ -z "$a" ]; then
+    raw=""
+    have pm   && raw=$(pm list packages -U 2>/dev/null | grep -F "package:$pkg " | parse_pm)
+    [ -z "$raw" ] && have cmd && raw=$(cmd package list packages -U 2>/dev/null | grep -F "package:$pkg " | parse_pm)
+    a=$(normalize_appid "$raw")
   fi
-  echo "$u"
+  [ -z "$a" ] && a=$(stat -c %u "/data/user/0/$pkg" 2>/dev/null)
+  [ -z "$a" ] && a=$(stat -c %u "/data/data/$pkg" 2>/dev/null)
+  a=$(normalize_appid "$a")
+  echo "$a"
+}
+
+installed() {
+  pkg="$1"
+  pm path "$pkg" 2>/dev/null | grep -q '^package:' && return 0
+  dumpsys package "$pkg" 2>/dev/null | grep -q -m1 -E 'appId=[0-9]+|userId=[0-9]+|codePath=' && return 0
+  [ -f /data/system/packages.list ] && grep -q "^$pkg " /data/system/packages.list 2>/dev/null && return 0
+  return 1
+}
+
+uids_of() {
+  pkg="$1"
+  appid=$(appid_of "$pkg")
+  [ -z "$appid" ] && return 0
+  found=""
+  found="$found $appid"
+  for d in "$USER_DATA_ROOT"/[0-9]*; do
+    [ -d "$d/$pkg" ] || continue
+    owner=$(stat -c %u "$d/$pkg" 2>/dev/null)
+    case "$owner" in ''|*[!0-9]*) continue ;; esac
+    [ "$owner" -lt 10000 ] && continue
+    found="$found $owner"
+  done
+  echo "$found" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' '
+}
+
+store_uids() {
+  pkg="$1"
+  uids=$(uids_of "$pkg")
+  if [ -n "$uids" ]; then
+    echo "$uids" > "$UIDDIR/$pkg.uids"
+    echo "$uids" | awk '{print $1}' > "$UIDDIR/$pkg.uid"
+  fi
+  echo "$uids"
 }
 
 apply_rules() {
@@ -102,27 +143,30 @@ heal_scope() {
 heal_scope
 
 # ---------- 逐个目标探测 uid + 加规则 ----------
-n=0
-while [ $n -lt 20 ]; do
-  missing=""
-  for p in $PKGS; do
-    u=$(store_uid "$p")
-    [ -z "$u" ] && missing="$missing $p"
-  done
-  [ -z "$missing" ] && break
-  n=$((n+1))
-  log "第 $n 轮仍有目标没取到 uid:$missing（15 秒后重试）"
-  sleep 15
-done
-
 for p in $PKGS; do
-  u=$(uid_of "$p")
-  if [ -n "$u" ]; then
-    log "target $p uid=$u"
-    apply_rules "$u"
-  else
-    log "skip $p（没有 uid，可能未安装）"
+  if ! installed "$p"; then
+    log "skip $p（未安装）"
+    : > "$UIDDIR/$p.uids"
+    : > "$UIDDIR/$p.uid"
+    continue
   fi
+  n=0
+  uids=""
+  while [ $n -lt $MAX_ROUNDS ]; do
+    uids=$(store_uids "$p")
+    [ -n "$uids" ] && break
+    n=$((n+1))
+    [ $n -eq 1 ] && log "target $p 已安装但 appId 未就绪，等待探测（最多 ${MAX_ROUNDS} 轮）"
+    sleep $RETRY_SEC
+  done
+  if [ -z "$uids" ]; then
+    log "WARN $p 已安装但始终取不到 uid，放弃（可手动排查 dumpsys）"
+    continue
+  fi
+  log "target $p uids=$uids"
+  for u in $uids; do
+    apply_rules "$u"
+  done
 done
 
 # ---------- 共享配置目录 ----------
@@ -134,14 +178,15 @@ done
 while true; do
   sleep 60
   for p in $PKGS; do
-    u=$(uid_of "$p")
-    if [ -z "$u" ]; then
-      u=$(store_uid "$p")
-    fi
-    [ -z "$u" ] && continue
-    if ! rules_ok "$u"; then
-      log "rules missing -> re-apply $p（uid=$u）"
-      apply_rules "$u"
-    fi
+    installed "$p" || continue
+    uids=$(uids_of "$p")
+    [ -z "$uids" ] && continue
+    echo "$uids" > "$UIDDIR/$p.uids"
+    for u in $uids; do
+      if ! rules_ok "$u"; then
+        log "rules missing -> re-apply $p（uid=$u）"
+        apply_rules "$u"
+      fi
+    done
   done
 done

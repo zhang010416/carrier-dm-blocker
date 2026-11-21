@@ -1,6 +1,6 @@
 id=carrier_dm_blocker
 name=运营商 DM 出站阻断
-version=2.0
-versionCode=2
+version=2.1
+versionCode=3
 author=躺平老咸鱼
 description=三家运营商预装 DM 合集：按 uid 阻断 联通 com.mobiletools.systemhelper / 移动 com.coloros.regservice / 电信 com.oppo.ctautoregist 的全部 IPv4+IPv6 出站，每 60 秒自愈重加规则，并自动补齐 LSPosed 作用域。与 CarrierDMBlocker（Xposed）联动。点击「操作」一键体检三家的状态。

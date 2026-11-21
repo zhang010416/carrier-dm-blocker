@@ -21,7 +21,13 @@ name_of() {
   esac
 }
 
-uid_of() { cat "$UIDDIR/$1.uid" 2>/dev/null; }
+uid_of() {
+  if [ -f "$UIDDIR/$1.uids" ]; then
+    cat "$UIDDIR/$1.uids" 2>/dev/null
+  else
+    cat "$UIDDIR/$1.uid" 2>/dev/null
+  fi
+}
 line() { echo "────────────────────────────────────"; }
 
 echo "╔══════════════════════════════════════╗"
@@ -69,19 +75,22 @@ for p in $PKGS; do
     *) echo "    状态 : ${ST:-未知}" ;;
   esac
 
-  # 规则
-  R4=0; R6=0
-  iptables  -S OUTPUT 2>/dev/null | grep -q -- "--uid-owner $U" && R4=1
-  ip6tables -S OUTPUT 2>/dev/null | grep -q -- "--uid-owner $U" && R6=1
-  if [ "$R4" = "1" ]; then echo "    IPv4 : OK"; else
-    iptables -I OUTPUT -m owner --uid-owner "$U" -j REJECT 2>/dev/null && echo "    IPv4 : 缺失 -> 已补上" || echo "    IPv4 : 缺失 -> 补失败"
-  fi
-  if [ "$R6" = "1" ]; then echo "    IPv6 : OK"; else
-    ip6tables -I OUTPUT -m owner --uid-owner "$U" -j REJECT 2>/dev/null && echo "    IPv6 : 缺失 -> 已补上" || echo "    IPv6 : 缺失 -> 补失败"
-  fi
-
-  # 连接
-  CONN=$(cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk -v u="$U" '$8==u {print $2,$3,$4}')
+  # 规则 / 连接：逐个 uid（机主 + 分身）检查
+  CONN_ALL=""
+  for u in $U; do
+    R4=0; R6=0
+    iptables  -S OUTPUT 2>/dev/null | grep -q -- "--uid-owner $u" && R4=1
+    ip6tables -S OUTPUT 2>/dev/null | grep -q -- "--uid-owner $u" && R6=1
+    if [ "$R4" = "1" ]; then echo "    IPv4[$u] : OK"; else
+      iptables -I OUTPUT -m owner --uid-owner "$u" -j REJECT 2>/dev/null && echo "    IPv4[$u] : 缺失 -> 已补上" || echo "    IPv4[$u] : 缺失 -> 补失败"
+    fi
+    if [ "$R6" = "1" ]; then echo "    IPv6[$u] : OK"; else
+      ip6tables -I OUTPUT -m owner --uid-owner "$u" -j REJECT 2>/dev/null && echo "    IPv6[$u] : 缺失 -> 已补上" || echo "    IPv6[$u] : 缺失 -> 补失败"
+    fi
+    CONN_ALL="$CONN_ALL$(cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk -v u="$u" '$8==u {print $2,$3,$4}')
+"
+  done
+  CONN=$(echo "$CONN_ALL" | grep -v '^$')
   if [ -z "$CONN" ]; then echo "    连接 : 无外连"; else echo "    连接 : ⚠️ 仍有连接"; echo "$CONN" | sed 's/^/           /'; fi
 
   # Xposed 心跳
@@ -115,9 +124,11 @@ BAD=0
 for p in $PKGS; do
   U=$(uid_of "$p")
   [ -z "$U" ] && continue
-  iptables -S OUTPUT 2>/dev/null | grep -q -- "--uid-owner $U" || BAD=1
-  C6=$(cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk -v u="$U" '$8==u' | wc -l)
-  [ "$C6" -gt 0 ] && BAD=1
+  for u in $U; do
+    iptables -S OUTPUT 2>/dev/null | grep -q -- "--uid-owner $u" || BAD=1
+    C6=$(cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk -v u="$u" '$8==u' | wc -l)
+    [ "$C6" -gt 0 ] && BAD=1
+  done
 done
 if [ "$BAD" = "0" ]; then
   echo "    ✅ 三家规则在位，当前零外连"

@@ -288,6 +288,21 @@ adb shell su -c "grep -a carrierdmblocker /data/adb/lspd/log/modules_*.log | tai
 
 ## 更新内容
 
+### v2.1
+
+- **修复多用户 UID 取错**：`pm list packages -U` 在有多用户的设备（如分身）返回
+  `userId × 100000 + appId` 的编码值（实测分身 user10 的电信包为 `1010107`），
+  v2.0 把它当成 appId，导致只封了分身、漏掉机主的 `10107`。现在统一把编码值取模
+  还原为 appId，并优先用 `dumpsys appId` / `packages.list`，同时遍历所有已存在的
+  用户数据目录，**机主与分身两个 UID 全部加入拦截**（如电信 `10107` + `1010107`）。
+- **消除开机约 5 分钟空窗**：v2.0 在任一包取不到 uid 时整体等待 20×15s，未安装的
+  联通 `SystemHelper` 会把已就绪的移动/电信规则一起拖后。现在改为逐包探测、
+  即到即加规则；确认未安装的包立即跳过。
+- 自检脚本 `action.sh` 同步支持展示/检查多个 uid（机主 + 分身）。
+- 新增 `tests/test_service_uid.sh`：用 mock 覆盖 `pm`/`dumpsys`/`stat`，
+  回归验证 PMS 隐藏包穿透、多用户 UID 归一化、机主+分身双覆盖、未装包跳过。
+  运行：`bash tests/test_service_uid.sh`。
+
 ### v2.0
 
 - **三合一**：三个独立的 Xposed 模块（syshelper / regservice / ctauto）合并为一个 APK，
